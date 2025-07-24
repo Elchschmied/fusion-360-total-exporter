@@ -2,9 +2,13 @@
 #Description-A convenient way to export all of your designs and projects in the event you suddenly find yourself in need of something like that.
 from __future__ import with_statement
 
-import adsk.core, adsk.fusion, adsk.cam, traceback
+import adsk.core
+import adsk.fusion
+import adsk.cam
+import traceback
 
 from logging import Logger, FileHandler, Formatter
+import logging
 from threading import Thread
 
 import time
@@ -12,318 +16,357 @@ import os
 import re
 
 
-
 class TotalExport(object):
-  def __init__(self, app):
-    self.app = app
-    self.ui = self.app.userInterface
-    self.data = self.app.data
-    self.documents = self.app.documents
-    self.log = Logger("Fusion 360 Total Export")
-    self.num_issues = 0
-    self.was_cancelled = False
-    
-  def __enter__(self):
-    return self
+    def __init__(self, app):
+        self.app = app
+        self.ui = self.app.userInterface
+        self.data = self.app.data
+        self.documents = self.app.documents
+        self.log = Logger("Fusion 360 Total Export")
+        # Ensure info messages (including project paths) are recorded in the log.
+        self.log.setLevel(logging.INFO)
+        self.num_issues = 0
+        self.was_cancelled = False
+        # Determines whether existing exported files should be overwritten.  This
+        # flag is set once at the beginning of the export run and then
+        # referenced for every subsequent file.  If True existing files are
+        # always overwritten; if False they are always skipped.
+        self.overwrite_existing: bool | None = None
 
-  def __exit__(self, exc_type, exc_val, exc_tb):
-    pass
+    def __enter__(self):
+        return self
 
-  def run(self, context):
-    self.ui.messageBox(
-      "Searching for and exporting files will take a while, depending on how many files you have.\n\n" \
-        "You won't be able to do anything else. It has to do everything in the main thread and open and close every file.\n\n" \
-          "Take an early lunch."
-      )
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
-    output_path = self._ask_for_output_path()
-
-    if output_path is None:
-      return
-
-    file_handler = FileHandler(os.path.join(output_path, 'output.log'))
-    file_handler.setFormatter(Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    self.log.addHandler(file_handler)
-
-    self.log.info("Starting export!")
-
-    self._export_data(output_path)
-
-    self.log.info("Done exporting!")
-
-    if self.was_cancelled:
-      self.ui.messageBox("Cancelled!")
-    elif self.num_issues > 0:
-      self.ui.messageBox("The exporting process ran into {num_issues} issue{english_plurals}. Please check the log for more information".format(
-        num_issues=self.num_issues,
-        english_plurals="s" if self.num_issues > 1 else ""
-        ))
-    else:
-      self.ui.messageBox("Export finished completely successfully!")
-
-  def _export_data(self, output_path):
-    progress_dialog = self.ui.createProgressDialog()
-    progress_dialog.show("Exporting data!", "", 0, 1, 1)
-
-    all_hubs = self.data.dataHubs
-    for hub_index in range(all_hubs.count):
-      hub = all_hubs.item(hub_index)
-
-      self.log.info("Exporting hub \"{}\"".format(hub.name))
-
-      all_projects = hub.dataProjects
-      for project_index in range(all_projects.count):
-        files = []
-        project = all_projects.item(project_index)
-        self.log.info("Exporting project \"{}\"".format(project.name))
-
-        folder = project.rootFolder
-
-        files.extend(self._get_files_for(folder))
-
-        progress_dialog.message = "Hub: {} of {}\nProject: {} of {}\nExporting design %v of %m".format(
-          hub_index + 1,
-          all_hubs.count,
-          project_index + 1,
-          all_projects.count
+    def run(self, context):
+        self.ui.messageBox(
+            "Searching for and exporting files will take a while, depending on how many files you have.\n\n"
+            "You won't be able to do anything else. It has to do everything in the main thread and open and close every file.\n\n"
+            "Take an early lunch."
         )
-        progress_dialog.maximumValue = len(files)
-        progress_dialog.reset()
 
-        if not files:
-          self.log.info("No files to export for this project")
-          continue
+        output_path = self._ask_for_output_path()
 
-        for file_index in range(len(files)):
-          if progress_dialog.wasCancelled:
-            self.log.info("The process was cancelled!")
-            self.was_cancelled = True
+        if output_path is None:
             return
 
-          file: adsk.core.DataFile = files[file_index]
-          progress_dialog.progressValue = file_index + 1
-          self._write_data_file(output_path, file)
-        self.log.info("Finished exporting project \"{}\"".format(project.name))
-      self.log.info("Finished exporting hub \"{}\"".format(hub.name))
-
-  def _ask_for_output_path(self):
-    folder_dialog = self.ui.createFolderDialog()
-    folder_dialog.title = "Where should we store this export?"
-    dialog_result = folder_dialog.showDialog()
-    if dialog_result != adsk.core.DialogResults.DialogOK:
-      return None
-
-    output_path = folder_dialog.folder
-
-    return output_path
-
-  def _get_files_for(self, folder):
-    files = []
-    for file in folder.dataFiles:
-      files.append(file)
-
-    for sub_folder in folder.dataFolders:
-      files.extend(self._get_files_for(sub_folder))
-    
-    return files
-
-  def _write_data_file(self, root_folder, file: adsk.core.DataFile):
-    if file.fileExtension != "f3d" and file.fileExtension != "f3z":
-      self.log.info("Not exporting file \"{}\"".format(file.name))
-      return
-
-    self.log.info("Exporting file \"{}\"".format(file.name))
-
-    try:
-      document = self.documents.open(file)
-
-      if document is None:
-        raise Exception("Documents.open returned None")
-
-      document.activate()
-    except BaseException as ex:
-      self.num_issues += 1
-      self.log.exception("Opening {} failed!".format(file.name), exc_info=ex)
-      return
-
-    try:
-      file_folder = file.parentFolder
-      file_folder_path = self._name(file_folder.name)
-
-      while file_folder.parentFolder is not None:
-        file_folder = file_folder.parentFolder
-        file_folder_path = os.path.join(self._name(file_folder.name), file_folder_path)
-
-      parent_project = file_folder.parentProject
-      parent_hub = parent_project.parentHub
-
-      file_folder_path = self._take(
-        root_folder,
-        "Hub {}".format(self._name(parent_hub.name)),
-        "Project {}".format(self._name(parent_project.name)),
-        file_folder_path,
-        self._name(file.name) + "." + file.fileExtension
+        # Ask the user once whether existing exported files should be overwritten.
+        # The result is stored in self.overwrite_existing and used for every file.
+        overwrite_prompt = (
+            "Es können bereits exportierte Dateien vorhanden sein.\n"
+            "Möchten Sie vorhandene Dateien überschreiben?"
         )
+        overwrite_result = self.ui.messageBox(
+            overwrite_prompt,
+            "Überschreiben?",
+            adsk.core.MessageBoxButtonTypes.YesNoButtonType
+        )
+        # DialogYes (value 2) indicates the user clicked Yes:contentReference[oaicite:1]{index=1}.
+        self.overwrite_existing = overwrite_result == adsk.core.DialogResults.DialogYes
 
-      if not os.path.exists(file_folder_path):
-        self.num_issues += 1
-        self.log.exception("Couldn't make root folder\"{}\"".format(file_folder_path))
-        return
+        file_handler = FileHandler(os.path.join(output_path, 'output.log'))
+        file_handler.setFormatter(Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        self.log.addHandler(file_handler)
 
-      self.log.info("Writing to \"{}\"".format(file_folder_path))
+        self.log.info("Starting export!")
 
-      fusion_document: adsk.fusion.FusionDocument = adsk.fusion.FusionDocument.cast(document)
-      design: adsk.fusion.Design = fusion_document.design
-      export_manager: adsk.fusion.ExportManager = design.exportManager
+        self._export_data(output_path)
 
-      file_export_path = os.path.join(file_folder_path, self._name(file.name))
-      # Write f3d/f3z file
-      options = export_manager.createFusionArchiveExportOptions(file_export_path)
-      export_manager.execute(options)
-      
-      self._write_component(file_folder_path, design.rootComponent)
+        self.log.info("Done exporting!")
 
-      self.log.info("Finished exporting file \"{}\"".format(file.name))
-    except BaseException as ex:
-      self.num_issues += 1
-      self.log.exception("Failed while working on \"{}\"".format(file.name), exc_info=ex)
-      raise
-    finally:
-      try:
-        if document is not None:
-          document.close(False)
-      except BaseException as ex:
-        self.num_issues += 1
-        self.log.exception("Failed to close \"{}\"".format(file.name), exc_info=ex)
+        if self.was_cancelled:
+            self.ui.messageBox("Cancelled!")
+        elif self.num_issues > 0:
+            self.ui.messageBox(
+                "The exporting process ran into {num_issues} issue{english_plurals}. Please check the log for more information".format(
+                    num_issues=self.num_issues,
+                    english_plurals="s" if self.num_issues > 1 else ""
+                )
+            )
+        else:
+            self.ui.messageBox("Export finished completely successfully!")
 
+    def _export_data(self, output_path):
+        progress_dialog = self.ui.createProgressDialog()
+        progress_dialog.show("Exporting data!", "", 0, 1, 1)
 
-  def _write_component(self, component_base_path, component: adsk.fusion.Component):
-    self.log.info("Writing component \"{}\" to \"{}\"".format(component.name, component_base_path))
-    design = component.parentDesign
-    
-    output_path = os.path.join(component_base_path, self._name(component.name))
+        all_hubs = self.data.dataHubs
+        for hub_index in range(all_hubs.count):
+            hub = all_hubs.item(hub_index)
 
-    self._write_step(output_path, component)
-    self._write_stl(output_path, component)
-    self._write_iges(output_path, component)
+            self.log.info("Exporting hub \"{}\"".format(hub.name))
 
-    sketches = component.sketches
-    for sketch_index in range(sketches.count):
-      sketch = sketches.item(sketch_index)
-      self._write_dxf(os.path.join(output_path, sketch.name), sketch)
+            all_projects = hub.dataProjects
+            for project_index in range(all_projects.count):
+                files = []
+                project = all_projects.item(project_index)
+                self.log.info("Exporting project \"{}\"".format(project.name))
 
-    occurrences = component.occurrences
-    for occurrence_index in range(occurrences.count):
-      occurrence = occurrences.item(occurrence_index)
-      sub_component = occurrence.component
-      sub_path = self._take(component_base_path, self._name(component.name))
-      self._write_component(sub_path, sub_component)
+                # Compute the base export directory for this project without creating it.
+                # The structure is <output_path>/Hub <hubName>/Project <projectName>
+                project_export_dir = os.path.join(
+                    output_path,
+                    "Hub {}".format(self._name(hub.name)),
+                    "Project {}".format(self._name(project.name))
+                )
+                # Log the current backup path for the project.  The actual
+                # directories are created later when exporting individual files.
+                self.log.info(
+                    "Sicherungspfad für Projekt \"{}\": {}".format(project.name, project_export_dir)
+                )
 
-  def _write_step(self, output_path, component: adsk.fusion.Component):
-    file_path = output_path + ".stp"
-    if os.path.exists(file_path):
-      self.log.info("Step file \"{}\" already exists".format(file_path))
-      return
+                folder = project.rootFolder
+                files.extend(self._get_files_for(folder))
 
-    self.log.info("Writing step file \"{}\"".format(file_path))
-    export_manager = component.parentDesign.exportManager
+                progress_dialog.message = "Hub: {} of {}\nProject: {} of {}\nExporting design %v of %m".format(
+                    hub_index + 1,
+                    all_hubs.count,
+                    project_index + 1,
+                    all_projects.count
+                )
+                progress_dialog.maximumValue = len(files)
+                progress_dialog.reset()
 
-    options = export_manager.createSTEPExportOptions(output_path, component)
-    export_manager.execute(options)
+                if not files:
+                    self.log.info("No files to export for this project")
+                    continue
 
-  def _write_stl(self, output_path, component: adsk.fusion.Component):
-    file_path = output_path + ".stl"
-    if os.path.exists(file_path):
-      self.log.info("Stl file \"{}\" already exists".format(file_path))
-      return
+                for file_index in range(len(files)):
+                    if progress_dialog.wasCancelled:
+                        self.log.info("The process was cancelled!")
+                        self.was_cancelled = True
+                        return
 
-    self.log.info("Writing stl file \"{}\"".format(file_path))
-    export_manager = component.parentDesign.exportManager
+                    file = files[file_index]  # type: adsk.core.DataFile
+                    progress_dialog.progressValue = file_index + 1
+                    self._write_data_file(output_path, file)
+                self.log.info("Finished exporting project \"{}\"".format(project.name))
+            self.log.info("Finished exporting hub \"{}\"".format(hub.name))
 
-    try:
-      options = export_manager.createSTLExportOptions(component, output_path)
-      export_manager.execute(options)
-    except BaseException as ex:
-      self.log.exception("Failed writing stl file \"{}\"".format(file_path), exc_info=ex)
+    def _ask_for_output_path(self):
+        folder_dialog = self.ui.createFolderDialog()
+        folder_dialog.title = "Where should we store this export?"
+        dialog_result = folder_dialog.showDialog()
+        if dialog_result != adsk.core.DialogResults.DialogOK:
+            return None
 
-      if component.occurrences.count + component.bRepBodies.count + component.meshBodies.count > 0:
-        self.num_issues += 1
+        output_path = folder_dialog.folder
 
-    bRepBodies = component.bRepBodies
-    meshBodies = component.meshBodies
+        return output_path
 
-    if (bRepBodies.count + meshBodies.count) > 0:
-      self._take(output_path)
-      for index in range(bRepBodies.count):
-        body = bRepBodies.item(index)
-        self._write_stl_body(os.path.join(output_path, body.name), body)
+    def _get_files_for(self, folder):
+        files = []
+        for file in folder.dataFiles:
+            files.append(file)
 
-      for index in range(meshBodies.count):
-        body = meshBodies.item(index)
-        self._write_stl_body(os.path.join(output_path, body.name), body)
-        
-  def _write_stl_body(self, output_path, body):
-    file_path = output_path + ".stl"
-    if os.path.exists(file_path):
-      self.log.info("Stl body file \"{}\" already exists".format(file_path))
-      return
+        for sub_folder in folder.dataFolders:
+            files.extend(self._get_files_for(sub_folder))
 
-    self.log.info("Writing stl body file \"{}\"".format(file_path))
-    export_manager = body.parentComponent.parentDesign.exportManager
+        return files
 
-    try:
-      options = export_manager.createSTLExportOptions(body, file_path)
-      export_manager.execute(options)
-    except BaseException:
-      # Probably an empty model, ignore it
-      pass
+    def _write_data_file(self, root_folder, file):
+        if file.fileExtension != "f3d" and file.fileExtension != "f3z":
+            self.log.info("Not exporting file \"{}\"".format(file.name))
+            return
 
-  def _write_iges(self, output_path, component: adsk.fusion.Component):
-    file_path = output_path + ".igs"
-    if os.path.exists(file_path):
-      self.log.info("Iges file \"{}\" already exists".format(file_path))
-      return
+        self.log.info("Exporting file \"{}\"".format(file.name))
 
-    self.log.info("Writing iges file \"{}\"".format(file_path))
+        document = None
+        try:
+            document = self.documents.open(file)
 
-    export_manager = component.parentDesign.exportManager
+            if document is None:
+                raise Exception("Documents.open returned None")
 
-    options = export_manager.createIGESExportOptions(file_path, component)
-    export_manager.execute(options)
+            document.activate()
+        except BaseException as ex:
+            self.num_issues += 1
+            self.log.exception("Opening {} failed!".format(file.name), exc_info=ex)
+            return
 
-  def _write_dxf(self, output_path, sketch: adsk.fusion.Sketch):
-    file_path = output_path + ".dxf"
-    if os.path.exists(file_path):
-      self.log.info("DXF sketch file \"{}\" already exists".format(file_path))
-      return
+        try:
+            file_folder = file.parentFolder
+            file_folder_path = self._name(file_folder.name)
 
-    self.log.info("Writing dxf sketch file \"{}\"".format(file_path))
+            while file_folder.parentFolder is not None:
+                file_folder = file_folder.parentFolder
+                file_folder_path = os.path.join(self._name(file_folder.name), file_folder_path)
 
-    sketch.saveAsDXF(file_path)
+            parent_project = file_folder.parentProject
+            parent_hub = parent_project.parentHub
 
-  def _take(self, *path):
-    out_path = os.path.join(*path)
-    os.makedirs(out_path, exist_ok=True)
-    return out_path
-  
-  def _name(self, name):
-    name = re.sub('[^a-zA-Z0-9 \n\.]', '', name).strip()
+            export_dir = self._take(
+                root_folder,
+                "Hub {}".format(self._name(parent_hub.name)),
+                "Project {}".format(self._name(parent_project.name)),
+                file_folder_path,
+                self._name(file.name) + "." + file.fileExtension
+            )
 
-    if name.endswith('.stp') or name.endswith('.stl') or name.endswith('.igs'):
-      name = name[0: -4] + "_" + name[-3:]
+            file_export_base = os.path.join(export_dir, self._name(file.name))
+            dest_archive = file_export_base + "." + file.fileExtension
 
-    return name
+            # If an archive already exists, use the global overwrite choice
+            # selected at the beginning of the run.  When overwrite_existing is
+            # False we skip exporting this design; when True we proceed and
+            # overwrite the existing export without additional prompts.
+            if os.path.exists(dest_archive):
+                if not self.overwrite_existing:
+                    self.log.info(
+                        "Skipping file \"{}\" because it already exists and overwriting was disabled.".format(
+                            file.name
+                        )
+                    )
+                    return
 
-    
+            self.log.info("Writing to \"{}\"".format(export_dir))
+
+            fusion_document = adsk.fusion.FusionDocument.cast(document)
+            design = fusion_document.design
+            export_manager = design.exportManager
+
+            options = export_manager.createFusionArchiveExportOptions(file_export_base)
+            export_manager.execute(options)
+
+            self._write_component(export_dir, design.rootComponent)
+
+            self.log.info("Finished exporting file \"{}\"".format(file.name))
+        except BaseException as ex:
+            self.num_issues += 1
+            self.log.exception("Failed while working on \"{}\"".format(file.name), exc_info=ex)
+            raise
+        finally:
+            try:
+                if document is not None:
+                    document.close(False)
+            except BaseException as ex:
+                self.num_issues += 1
+                self.log.exception("Failed to close \"{}\"".format(file.name), exc_info=ex)
+
+    def _write_component(self, component_base_path, component):
+        self.log.info("Writing component \"{}\" to \"{}\"".format(component.name, component_base_path))
+        design = component.parentDesign
+
+        output_path = os.path.join(component_base_path, self._name(component.name))
+
+        self._write_step(output_path, component)
+
+        sketches = component.sketches
+        for sketch_index in range(sketches.count):
+            sketch = sketches.item(sketch_index)
+            self._write_dxf(os.path.join(output_path, sketch.name), sketch)
+
+        occurrences = component.occurrences
+        for occurrence_index in range(occurrences.count):
+            occurrence = occurrences.item(occurrence_index)
+            sub_component = occurrence.component
+            sub_path = self._take(component_base_path, self._name(component.name))
+            self._write_component(sub_path, sub_component)
+
+    def _write_step(self, output_path, component):
+        file_path = output_path + ".stp"
+        if os.path.exists(file_path):
+            self.log.info("Step file \"{}\" already exists".format(file_path))
+            return
+
+        self.log.info("Writing step file \"{}\"".format(file_path))
+        export_manager = component.parentDesign.exportManager
+
+        options = export_manager.createSTEPExportOptions(output_path, component)
+        export_manager.execute(options)
+
+    def _write_stl(self, output_path, component):
+        file_path = output_path + ".stl"
+        if os.path.exists(file_path):
+            self.log.info("Stl file \"{}\" already exists".format(file_path))
+            return
+
+        self.log.info("Writing stl file \"{}\"".format(file_path))
+        export_manager = component.parentDesign.exportManager
+
+        try:
+            options = export_manager.createSTLExportOptions(component, output_path)
+            export_manager.execute(options)
+        except BaseException as ex:
+            self.log.exception("Failed writing stl file \"{}\"".format(file_path), exc_info=ex)
+
+            if component.occurrences.count + component.bRepBodies.count + component.meshBodies.count > 0:
+                self.num_issues += 1
+
+        bRepBodies = component.bRepBodies
+        meshBodies = component.meshBodies
+
+        if (bRepBodies.count + meshBodies.count) > 0:
+            self._take(output_path)
+            for index in range(bRepBodies.count):
+                body = bRepBodies.item(index)
+                self._write_stl_body(os.path.join(output_path, body.name), body)
+
+            for index in range(meshBodies.count):
+                body = meshBodies.item(index)
+                self._write_stl_body(os.path.join(output_path, body.name), body)
+
+    def _write_stl_body(self, output_path, body):
+        file_path = output_path + ".stl"
+        if os.path.exists(file_path):
+            self.log.info("Stl body file \"{}\" already exists".format(file_path))
+            return
+
+        self.log.info("Writing stl body file \"{}\"".format(file_path))
+        export_manager = body.parentComponent.parentDesign.exportManager
+
+        try:
+            options = export_manager.createSTLExportOptions(body, file_path)
+            export_manager.execute(options)
+        except BaseException:
+            pass
+
+    def _write_iges(self, output_path, component):
+        file_path = output_path + ".igs"
+        if os.path.exists(file_path):
+            self.log.info("Iges file \"{}\" already exists".format(file_path))
+            return
+
+        self.log.info("Writing iges file \"{}\"".format(file_path))
+
+        export_manager = component.parentDesign.exportManager
+
+        options = export_manager.createIGESExportOptions(file_path, component)
+        export_manager.execute(options)
+
+    def _write_dxf(self, output_path, sketch):
+        file_path = output_path + ".dxf"
+        if os.path.exists(file_path):
+            self.log.info("DXF sketch file \"{}\" already exists".format(file_path))
+            return
+
+        self.log.info("Writing dxf sketch file \"{}\"".format(file_path))
+
+        sketch.saveAsDXF(file_path)
+
+    def _take(self, *path):
+        out_path = os.path.join(*path)
+        os.makedirs(out_path, exist_ok=True)
+        return out_path
+
+    def _name(self, name):
+        name = re.sub('[^a-zA-Z0-9 \n\.]', '', name).strip()
+
+        if name.endswith('.stp') or name.endswith('.stl') or name.endswith('.igs'):
+            name = name[0: -4] + "_" + name[-3:]
+
+        return name
+
 
 def run(context):
-  ui = None
-  try:
-    app = adsk.core.Application.get()
+        ui = None
+        try:
+            app = adsk.core.Application.get()
 
-    with TotalExport(app) as total_export:
-      total_export.run(context)
+            with TotalExport(app) as total_export:
+                total_export.run(context)
 
-  except:
-    ui  = app.userInterface
-    ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
+        except:
+            ui  = app.userInterface
+            ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
