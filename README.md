@@ -1,3 +1,5 @@
+# Added funtion to write pathes into logfile. Added selection for exporting all files or only new files.
+
 # Fusion 360 Total Exporter
 Need to export all of your fusion data in a bunch of formats? We've got you covered. This will export your designs across all hubs, projects, files, and components. It exports them in STL, STEP, and IGES format. It also exports the sketches as DXF files. In addition to those, an f3d/f3z file will be exported for each component/assembly file in all of your projects, across all hubs. It doesn't ask what you want written out, it just writes out the latest version of everything, to the folder of your choice.
 
