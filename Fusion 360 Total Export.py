@@ -1,3 +1,9 @@
+<<<<<<< Updated upstream
+=======
+#Author-Justin Nesselrotte
+#Description-A convenient way to export all of your designs and projects in the event you suddenly find yourself in need of something like that.
+
+>>>>>>> Stashed changes
 from __future__ import with_statement
 
 import adsk.core
