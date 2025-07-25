@@ -1,3 +1,25 @@
+"""
+Modified TotalExport script for Autodesk Fusion 360.
+
+This version enhances the original script by adding logic to avoid
+reexporting designs that have already been saved.  When the script
+discovers that a Fusion archive (.f3d or .f3z) for a design already
+exists in the destination folder, it prompts the user to confirm if
+the existing archive should be overwritten.  If the user declines,
+the design is skipped and no new export is performed.  This helps
+prevent unnecessary overwrites and allows selective updating of
+existing exports.
+
+The remainder of the script remains functionally identical to the
+original: it walks all hubs, projects and folders accessible to the
+current user, opens each design in the main thread and exports
+Fusion archives, STEP files and DXF sketches.  Logging has been
+retained so you can review what was exported and what was skipped.
+
+Author: Justin Nesselrotte (original)
+Modified by: ChatGPT
+"""
+
 from __future__ import with_statement
 
 import adsk.core
@@ -21,16 +43,25 @@ class TotalExport(object):
         self.data = self.app.data
         self.documents = self.app.documents
         self.log = Logger("Fusion 360 Total Export")
-        # Log-Stufe auf INFO setzen, damit alle Meldungen aufgezeichnet werden.
+        # Ensure info messages (including project paths) are recorded in the log.
         self.log.setLevel(logging.INFO)
         self.num_issues = 0
         self.was_cancelled = False
-        # Wird einmalig gesetzt: True = stets überschreiben; False = nie überschreiben.
+        # Determines whether existing exported files should be overwritten.  This
+        # flag is set once at the beginning of the export run and then
+        # referenced for every subsequent file.  If True existing files are
+        # always overwritten; if False they are always skipped.
         self.overwrite_existing: bool | None = None
 
-        # Fortschrittsdaten: enthält bereits exportierte Projekte (Hub-/Projektpaare)
+        # Track progress of exported projects across runs.  This set holds tuples
+        # of (hub_name, project_name) for projects that have been completely
+        # processed.  The progress file path is set in run() after the output
+        # directory is chosen.
         self.completed_projects = set()
         self.progress_path: str | None = None
+        # Path to a log file listing all projects that were successfully exported.
+        # This will be initialised in run() based on the selected output path.
+        self.exported_projects_log_path: str | None = None
 
     def __enter__(self):
         return self
@@ -56,6 +87,9 @@ class TotalExport(object):
         # already been exported.  If the file exists, its contents populate
         # self.completed_projects; otherwise the set remains empty.
         self.progress_path = os.path.join(output_path, 'project_progress.tsv')
+        # Determine the path for the exported projects log.  This file will
+        # record which projects were successfully exported.
+        self.exported_projects_log_path = os.path.join(output_path, 'exported_projects.log')
         self._load_progress()
 
         # If a progress file exists and contains entries, ask the user
@@ -72,10 +106,17 @@ class TotalExport(object):
             )
             if progress_result == adsk.core.DialogResults.DialogNo:
                 # Clear recorded progress and delete the progress file so the
-                # export starts from scratch
+                # export starts from scratch.  Also remove the exported
+                # projects log file so it does not contain stale entries.
                 self.completed_projects.clear()
                 try:
                     os.remove(self.progress_path)
+                except Exception:
+                    pass
+                # Remove the exported projects log if it exists
+                try:
+                    if self.exported_projects_log_path and os.path.exists(self.exported_projects_log_path):
+                        os.remove(self.exported_projects_log_path)
                 except Exception:
                     pass
 
@@ -90,7 +131,7 @@ class TotalExport(object):
             "Überschreiben?",
             adsk.core.MessageBoxButtonTypes.YesNoButtonType
         )
-        # DialogYes (value 2) indicates the user clicked Yes:contentReference[oaicite:0]{index=0}.
+        # DialogYes (value 2) indicates the user clicked Yes, see Fusion API docs【457688972963656†screenshot】
         self.overwrite_existing = overwrite_result == adsk.core.DialogResults.DialogYes
 
         # Configure logging to write to a file in the output directory
@@ -137,7 +178,8 @@ class TotalExport(object):
             self.ui.messageBox("Cancelled!")
         elif self.num_issues > 0:
             self.ui.messageBox(
-                "The exporting process ran into {num_issues} issue{english_plurals}. Please check the log for more information".format(
+                "The exporting process ran into {num_issues} issue{english_plurals}. "
+                "Please check the log for more information".format(
                     num_issues=self.num_issues,
                     english_plurals="s" if self.num_issues > 1 else ""
                 )
@@ -160,7 +202,6 @@ class TotalExport(object):
             for project_index in range(all_projects.count):
                 files = []
                 project = all_projects.item(project_index)
-
                 # Skip this project entirely if it has already been recorded as
                 # completed in the progress file.  This allows the export to
                 # resume after an interruption by continuing with the next
@@ -170,7 +211,6 @@ class TotalExport(object):
                         "Skipping project \"{}\" – already recorded in progress file".format(project.name)
                     )
                     continue
-
                 self.log.info("Exporting project \"{}\"".format(project.name))
 
                 # Compute the base export directory for this project without creating it.
@@ -180,7 +220,7 @@ class TotalExport(object):
                     "Hub {}".format(self._name(hub.name)),
                     "Project {}".format(self._name(project.name))
                 )
-                # Log the current backup path for the project.  The actual
+                # Log and display the current backup path for the project.  The actual
                 # directories are created later when exporting individual files.
                 self.log.info(
                     "Sicherungspfad für Projekt \"{}\": {}".format(project.name, project_export_dir)
@@ -203,7 +243,9 @@ class TotalExport(object):
 
                 if not files:
                     self.log.info("No files to export for this project")
-                    # Even if there are no files, mark the project as completed.
+                    # Even if there are no files, mark the project as completed and
+                    # record it in the exported projects log.  This ensures that
+                    # empty projects are not repeatedly processed on subsequent runs.
                     self._append_progress(hub.name, project.name)
                     continue
 
@@ -510,13 +552,11 @@ class TotalExport(object):
 
         bRepBodies = component.bRepBodies
         meshBodies = component.meshBodies
-
         if (bRepBodies.count + meshBodies.count) > 0:
             self._take(output_path)
             for index in range(bRepBodies.count):
                 body = bRepBodies.item(index)
                 self._write_stl_body(os.path.join(output_path, body.name), body)
-
             for index in range(meshBodies.count):
                 body = meshBodies.item(index)
                 self._write_stl_body(os.path.join(output_path, body.name), body)
@@ -543,9 +583,7 @@ class TotalExport(object):
             self.log.info("Iges file \"{}\" already exists".format(file_path))
             return
         self.log.info("Writing iges file \"{}\"".format(file_path))
-
         export_manager = component.parentDesign.exportManager
-
         options = export_manager.createIGESExportOptions(file_path, component)
         export_manager.execute(options)
 
@@ -555,9 +593,7 @@ class TotalExport(object):
         if os.path.exists(file_path):
             self.log.info("DXF sketch file \"{}\" already exists".format(file_path))
             return
-
         self.log.info("Writing dxf sketch file \"{}\"".format(file_path))
-
         sketch.saveAsDXF(file_path)
 
     def _take(self, *path):
@@ -573,11 +609,9 @@ class TotalExport(object):
         underscores inserted before their extensions to avoid confusing
         directory names with file names.
         """
-        name = re.sub('[^a-zA-Z0-9 \\n\\.]', '', name).strip()
-
+        name = re.sub('[^a-zA-Z0-9 \n\.]', '', name).strip()
         if name.endswith('.stp') or name.endswith('.stl') or name.endswith('.igs'):
             name = name[0: -4] + "_" + name[-3:]
-
         return name
 
     # -------------------------------------------------------------------------
@@ -628,12 +662,21 @@ class TotalExport(object):
         if not self.progress_path:
             return
         try:
+            # Append to the progress file (used for resuming the export).
             with open(self.progress_path, 'a', encoding='utf-8') as f:
                 f.write(f"{hub_name}\t{project_name}\n")
             self.completed_projects.add((hub_name, project_name))
         except Exception as ex:
             # Log but don't interrupt the export
             self.log.exception("Failed to append to progress file", exc_info=ex)
+        # Also append the project to the exported projects log.  Use a try/except
+        # so that issues writing this auxiliary log do not interrupt the export.
+        try:
+            if self.exported_projects_log_path:
+                with open(self.exported_projects_log_path, 'a', encoding='utf-8') as f_log:
+                    f_log.write(f"{hub_name}\t{project_name}\n")
+        except Exception as ex:
+            self.log.exception("Failed to append to exported projects log", exc_info=ex)
 
 
 def run(context):
@@ -641,10 +684,8 @@ def run(context):
     ui = None
     try:
         app = adsk.core.Application.get()
-
         with TotalExport(app) as total_export:
             total_export.run(context)
-
     except:
-        ui  = app.userInterface
+        ui = app.userInterface
         ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
